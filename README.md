@@ -1,6 +1,6 @@
 # NEXORA-musicBOT
 
-**NEXORA-musicBOT** は、Discord サーバー向けの音楽再生、自動TTS、AIチャット、サーバー管理機能を備えたBotです。  
+**NEXORA-musicBOT** は、Discord サーバー向けの音楽再生、自動TTS、AIサポート、サーバー管理機能を備えたBotです。  
 Python、discord.py、yt-dlp、FFmpeg、edge-tts を使用しています。
 
 - Author: **yomu.(h1n4)**
@@ -16,7 +16,7 @@ Python、discord.py、yt-dlp、FFmpeg、edge-tts を使用しています。
 - `edge-tts` を使用したVC読み上げ
 - テキストチャンネル単位の自動TTS
 - VC入退室通知の読み上げ
-- Groq API を使用したAIチャット
+- Groq API を使用したAIサポート
 - サーバーごとの再生履歴、お気に入り、キュー保存・復元
 - 睡眠タイマー、DJモード、リクエスト制限
 - Botステータス、Ping、CPU、RAM、ストレージ空き容量の確認

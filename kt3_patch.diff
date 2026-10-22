@@ -1,0 +1,286 @@
+--- main.py (変更前)
++++ main.py (変更後)
+@@ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   STEP 1 : MEDIA_EXTENSIONS に .kt3 / .kt4 を追加
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ @@
+
+ # Attachment playback fix: media-v5
+-MEDIA_EXTENSIONS = {'.wav', '.wave', '.mp3', '.mp4', '.m4a', '.aac', '.flac',
+-                    '.ogg', '.oga', '.opus', '.wma', '.webm', '.mkv', '.mov', '.m4v'}
++MEDIA_EXTENSIONS = {'.wav', '.wave', '.mp3', '.mp4', '.m4a', '.aac', '.flac',
++                    '.ogg', '.oga', '.opus', '.wma', '.webm', '.mkv', '.mov', '.m4v',
++                    '.kt3', '.kt4'}
+
+
+@@ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   STEP 2 : 追加コードを try_prefix_media の直前（同じモジュールスコープ）に挿入
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ @@
+
+ MEDIA_MAX_BYTES = 100 * 1024 * 1024
+ ...
++# ============================================================
++# KT3 / KT4 サポート
++# https://github.com/KEITO00/kt3-format
++# ============================================================
++
++import struct as _struct
++import subprocess as _subprocess
++
++_KT3_MAGIC_AUDIO  = b'KT3'
++_KT3_MAGIC_VIDEO  = b'KT4'
++_KT3_HEADER_SIZE  = 48
++_KTC_MAGIC        = b'KTC\x00'
++
++# ktc CLI ツールのパス（KTC 形式の音声のデコードに使用）
++# https://github.com/KEITO00/ktc を cargo build --release でビルドして
++# KTC_CLI 環境変数にパスを設定するか、PATH 上の 'ktc' コマンドを使用します。
++KTC_CLI_PATH = os.getenv('KTC_CLI', 'ktc')
++
++
++def _kt3_parse(data: bytes) -> tuple[dict, dict]:
++    """
++    KT3/KT4 のヘッダーとメタ情報（JSON）を解析する。
++
++    Returns (hdr, meta)
++    """
++    if len(data) < _KT3_HEADER_SIZE:
++        raise ValueError(
++            f'.kt3/.kt4 ファイルが短すぎます（{len(data)} バイト）'
++        )
++
++    magic = data[0:3]
++    if magic not in (_KT3_MAGIC_AUDIO, _KT3_MAGIC_VIDEO):
++        raise ValueError(
++            f'KT3/KT4 マジックバイトが一致しません: {magic!r}'
++        )
++
++    hdr = {
++        'is_kt4':          magic == _KT3_MAGIC_VIDEO,
++        'version':         data[4],
++        'media_format':    data[5],
++        'meta_len':        _struct.unpack_from('<I', data, 24)[0],
++        'lyrics_len':      _struct.unpack_from('<I', data, 28)[0],
++        'media_len':       _struct.unpack_from('<I', data, 32)[0],
++        'spark_len':       _struct.unpack_from('<I', data, 38)[0],
++        'frame_cache_len': _struct.unpack_from('<I', data, 42)[0],
++    }
++
++    meta_start = _KT3_HEADER_SIZE
++    meta_end   = meta_start + hdr['meta_len']
++    try:
++        meta = json.loads(data[meta_start:meta_end].decode('utf-8', errors='replace'))
++    except Exception:
++        meta = {}
++
++    return hdr, meta
++
++
++def _kt3_guess_suffix(audio: bytes, is_kt4: bool, media_format: int) -> str:
++    """先頭マジックから音声ファイルの拡張子を推定する（KTC 判定は呼び出し元）。"""
++    if audio[:4] == b'OggS':
++        return '.ogg'
++    if len(audio) >= 3 and (
++        audio[:3] == b'ID3'
++        or audio[:2] in (b'\xff\xfb', b'\xff\xf3', b'\xff\xf2')
++    ):
++        return '.mp3'
++    if audio[:4] in (b'RIFF', b'WAVE'):
++        return '.wav'
++    if len(audio) >= 8 and audio[4:8] in (b'ftyp', b'mdat', b'moov'):
++        return '.mp4'
++    if audio[:4] == b'\x1aE\xdf\xa3':
++        return '.webm'
++    if is_kt4:
++        return '.mp4' if media_format == 0 else '.webm'
++    return {0: '.mp3', 1: '.ogg', 2: '.wav', 3: '.m4a', 4: '.ogg'}.get(media_format, '.ogg')
++
++
++async def _ktc_decode_to_wav(ktc_bytes: bytes, guild_id: int) -> str:
++    """
++    KTC バイト列を WAV ファイルにデコードし、一時ファイルパスを返す。
++
++    ktc CLI（https://github.com/KEITO00/ktc）が必要。
++    見つからない場合は RuntimeError を送出する。
++    """
++    ktc_cli = shutil.which(KTC_CLI_PATH) or shutil.which('ktc')
++    if not ktc_cli:
++        raise RuntimeError(
++            'KTC デコーダー CLI が見つかりません。\n'
++            'https://github.com/KEITO00/ktc を cargo build --release でビルドし、\n'
++            'KTC_CLI 環境変数またはシステム PATH に配置してください。'
++        )
++
++    fd_in, path_in = tempfile.mkstemp(
++        prefix=f'nexora_ktc_in_{guild_id}_', suffix='.ktc'
++    )
++    os.close(fd_in)
++
++    fd_out, path_out = tempfile.mkstemp(
++        prefix=f'nexora_ktc_out_{guild_id}_', suffix='.wav'
++    )
++    os.close(fd_out)
++
++    try:
++        with open(path_in, 'wb') as f:
++            f.write(ktc_bytes)
++
++        loop = asyncio.get_running_loop()
++
++        def _run() -> _subprocess.CompletedProcess:
++            return _subprocess.run(
++                [ktc_cli, path_in, path_out],
++                capture_output=True,
++                timeout=60,
++            )
++
++        result = await asyncio.wait_for(
++            loop.run_in_executor(None, _run),
++            timeout=70,
++        )
++
++        if result.returncode != 0:
++            stderr = (result.stderr or b'').decode('utf-8', errors='replace')
++            raise RuntimeError(
++                f'ktc デコード失敗 (code={result.returncode}):\n'
++                + strip_ansi(stderr)[:500]
++            )
++
++        if not os.path.getsize(path_out):
++            raise RuntimeError('ktc 変換後の WAV ファイルが空です。')
++
++        return path_out
++
++    except Exception:
++        try:
++            os.remove(path_out)
++        except OSError:
++            pass
++        raise
++    finally:
++        try:
++            os.remove(path_in)
++        except OSError:
++            pass
++
++
++async def kt3_prepare_audio(
++    kt_data: bytes,
++    guild_id: int,
++    directory: str,
++) -> tuple[str, str]:
++    """
++    .kt3 / .kt4 のバイト列から音声を抽出し、FFmpeg が再生可能な
++    一時ファイルを用意する。
++
++    Returns
++    -------
++    (path, display_name)
++        path         : 一時ファイルの絶対パス（使用後に削除すること）
++        display_name : Discord に表示するタイトル文字列
++
++    Raises
++    ------
++    ValueError / RuntimeError  解析・変換失敗時
++    """
++    hdr, meta = _kt3_parse(kt_data)
++
++    title  = str(meta.get('title',  '') or '').strip() or 'Unknown'
++    artist = str(meta.get('artist', '') or '').strip()
++    display_name = f'{artist} - {title}' if artist else title
++
++    is_kt4          = hdr['is_kt4']
++    version         = hdr['version']
++    media_format    = hdr['media_format']
++    media_len       = hdr['media_len']
++    meta_len        = hdr['meta_len']
++    lyrics_len      = hdr['lyrics_len']
++
++    audio_len_meta  = int(meta.get('audioLen', 0) or 0)
++    stems           = meta.get('stems') or {}
++    vocal_len       = int(stems.get('vocalLen', 0) or 0)
++    inst_len        = int(stems.get('instLen',  0) or 0)
++    thumbnail_len   = int(meta.get('thumbnailLen', 0) or 0)
++
++    media_start = _KT3_HEADER_SIZE + meta_len + lyrics_len
++
++    # ── 音声バイト列の取り出し ──────────────────────────────
++    if not is_kt4:
++        # KT3（音声ファイル）
++        if media_len > 0:
++            audio = kt_data[media_start:media_start + media_len]
++        elif vocal_len > 0:
++            off   = len(kt_data) - thumbnail_len - inst_len - vocal_len
++            audio = kt_data[off:off + vocal_len]
++        else:
++            raise ValueError('.kt3 に再生可能な音声データが見つかりません。')
++    else:
++        # KT4（動画ファイル）
++        if version >= 7 and audio_len_meta > 0:
++            # version 7: 音声は MP4 外側に KTC で格納
++            tail = len(kt_data) - thumbnail_len - inst_len - vocal_len - audio_len_meta
++            if tail < media_start:
++                raise ValueError('.kt4 v7 の音声オフセットが不正です。')
++            audio = kt_data[tail:tail + audio_len_meta]
++        elif media_len > 0:
++            # version 1〜6: MP4 本体（映像+音声トラック）
++            audio = kt_data[media_start:media_start + media_len]
++        elif vocal_len > 0:
++            off   = len(kt_data) - thumbnail_len - inst_len - vocal_len
++            audio = kt_data[off:off + vocal_len]
++        else:
++            raise ValueError('.kt4 に再生可能なメディアデータが見つかりません。')
++
++    if not audio:
++        raise ValueError('音声バイト列が空です。')
++
++    # ── KTC かどうかを判定 ──────────────────────────────────
++    if audio[:4] == _KTC_MAGIC:
++        # KTC → WAV 変換（ktc CLI が必要）
++        wav_path = await _ktc_decode_to_wav(audio, guild_id)
++        return wav_path, display_name
++
++    # KTC 以外（Ogg/MP3/WAV/AAC/MP4 等）→ そのまま書き出す
++    suffix = _kt3_guess_suffix(audio, is_kt4, media_format)
++    fd, path = tempfile.mkstemp(
++        prefix=f'{guild_id}_kt3_', suffix=suffix, dir=directory
++    )
++    os.close(fd)
++    with open(path, 'wb') as f:
++        f.write(audio)
++    return path, display_name
++
++
+ async def try_prefix_media(ctx, query, insert_next=False):
+
+
+@@ ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   STEP 3 : try_prefix_media 内の「ファイルが空です」の直後に挿入
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ @@
+
+         if not os.path.getsize(path):
+             raise ValueError('ファイルが空です。')
++
++        # ── KT3 / KT4 音声抽出 ──────────────────────────────
++        _ext = os.path.splitext(path)[1].lower()
++        if _ext in ('.kt3', '.kt4'):
++            with open(path, 'rb') as _f:
++                _kt_data = _f.read()
++            # 元の .kt3/.kt4 一時ファイルは不要なので削除
++            try:
++                os.remove(path)
++            except OSError:
++                pass
++            path = None
++            downloaded = False  # except ブロックでの二重削除を防ぐ
++            try:
++                path, name = await kt3_prepare_audio(
++                    _kt_data, ctx.guild.id, directory
++                )
++                downloaded = True
++            except Exception as _e:
++                raise ValueError(
++                    f'.kt3/.kt4 の音声抽出に失敗しました:\n{_e}'
++                )
++        # ── KT3 / KT4 音声抽出ここまで ──────────────────────
+
+         track = Track(title=name, webpage_url='', requester_id=ctx.author.id,
